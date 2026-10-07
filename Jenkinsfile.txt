@@ -1,0 +1,244 @@
+pipeline {
+
+    agent any
+
+    tools {
+        jdk 'java17'
+    }
+
+    environment {
+        DOCKER_IMAGE = 'sadhiqkv/spring-petclinic'
+        SONAR_URL = 'http://172.31.6.225:9000'
+        NEXUS_URL = 'http://172.31.5.0:8081/repository/maven-snap/'
+        MINIKUBE_HOST = '172.31.14.71'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/sadhiqkv/spring-petclinic.git'
+            }
+        }
+
+        stage('Maven Build & Test') {
+            steps {
+                sh '''
+                    chmod +x mvnw
+                    ./mvnw clean verify
+                '''
+            }
+        }
+
+        stage('Trivy Filesystem Scan') {
+            steps {
+                sh '''
+                    mkdir -p /var/tmp/trivy
+                    TMPDIR=/var/tmp/trivy trivy fs \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0 \
+                    .
+                '''
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+                        -Dsonar.projectKey=Java-Demo-App \
+                        -Dsonar.projectName="Java Demo App"
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+    stage('Nexus Deploy') {
+        steps {
+            withCredentials([
+                usernamePassword(
+                    credentialsId: 'nexus-credentials',
+                    usernameVariable: 'NEXUS_USERNAME',
+                    passwordVariable: 'NEXUS_PASSWORD'
+                )
+            ]) {
+                sh '''
+                    trap 'rm -f nexus-settings.xml' EXIT
+    
+                    cat > nexus-settings.xml <<EOF
+    <settings>
+        <servers>
+            <server>
+                <id>nexus-snapshots</id>
+                <username>${NEXUS_USERNAME}</username>
+                <password>${NEXUS_PASSWORD}</password>
+            </server>
+        </servers>
+    </settings>
+    EOF
+    
+                    ./mvnw deploy \
+                    -s nexus-settings.xml \
+                    -DaltDeploymentRepository=nexus-snapshots::default::${NEXUS_URL} \
+                    -DskipTests \
+                    -Dcheckstyle.skip=true
+                '''
+            }
+        }
+    }
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    docker build \
+                    -t ${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                    .
+                '''
+            }
+        }
+
+        stage('Trivy Docker Image Scan') {
+            steps {
+                sh '''
+                    mkdir -p /var/tmp/trivy
+                    TMPDIR=/var/tmp/trivy trivy image \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0 \
+                    ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Docker Hub Push') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        echo "${DOCKER_PASSWORD}" | docker login \
+                            --username "${DOCKER_USERNAME}" \
+                            --password-stdin
+
+                        docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                        docker tag \
+                            ${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                            ${DOCKER_IMAGE}:latest
+
+                        docker push ${DOCKER_IMAGE}:latest
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Minikube') {
+            steps {
+                sshagent(credentials: ['minikube-ssh']) {
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "kubectl version --client"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube status"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "mkdir -p ~/petclinic-k8s"
+                    '''
+
+                    sh '''
+                        scp -o StrictHostKeyChecking=no \
+                            k8s/db.yml \
+                            ubuntu@${MINIKUBE_HOST}:~/petclinic-k8s/db.yml
+
+                        scp -o StrictHostKeyChecking=no \
+                            k8s/petclinic.yml \
+                            ubuntu@${MINIKUBE_HOST}:~/petclinic-k8s/petclinic.yml
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "sed -i 's|IMAGE_PLACEHOLDER|${DOCKER_IMAGE}:${BUILD_NUMBER}|' ~/petclinic-k8s/petclinic.yml"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- apply -f ~/petclinic-k8s/db.yml"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- apply -f ~/petclinic-k8s/petclinic.yml"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- rollout status deployment/demo-db --timeout=180s"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- rollout status deployment/petclinic --timeout=180s"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- get pods -o wide"
+                    '''
+
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                            ubuntu@${MINIKUBE_HOST} \
+                            "minikube kubectl -- get services"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '=========================================='
+            echo 'PIPELINE COMPLETED SUCCESSFULLY'
+            echo '=========================================='
+        }
+
+        failure {
+            echo '=========================================='
+            echo 'PIPELINE FAILED - CHECK THE FAILED STAGE'
+            echo '=========================================='
+        }
+
+        always {
+            sh 'docker logout || true'
+        }
+    }
+}
